@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: predictive-healthcare-analytics
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /api/health
+    envVars:
+      - key: PHA_SECRET_KEY
+        generateValue: true
+      - key: PHA_COOKIE_SECURE
+        value: "1"

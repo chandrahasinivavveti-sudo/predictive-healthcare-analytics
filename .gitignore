@@ -1,0 +1,17 @@
+# Secrets and local-only data
+.env
+.env.*
+!.env.example
+*.key
+secrets/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# Patient files and local database must not be committed
+instance/
+uploads/
+*.db
+*.sqlite
+*.sqlite3
