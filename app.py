@@ -4,6 +4,7 @@ import json
 import sqlite3
 import secrets
 import base64
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from functools import wraps
@@ -382,6 +383,27 @@ def get_ai_client():
 
 AI_MODEL = os.environ.get("PHA_AI_MODEL", "gemini-3.8-flash")
 
+
+def is_gemini_unavailable(exc):
+    """Return True when Gemini reports a temporary 503 outage."""
+    status_code = getattr(exc, "status_code", None)
+    message = str(exc)
+    return status_code == 503 or ("503" in message and "UNAVAILABLE" in message)
+
+
+def generate_gemini_content(client, **kwargs):
+    """Retry a Gemini 503 once; do not retry quota or other errors."""
+    for attempt in range(2):
+        try:
+            return client.models.generate_content(**kwargs)
+        except Exception as exc:
+            if not is_gemini_unavailable(exc) or attempt == 1:
+                raise
+            app.logger.warning(
+                "Gemini returned 503 UNAVAILABLE; retrying once after 2 seconds."
+            )
+            time.sleep(2)
+
 AI_MEDICAL_INSTRUCTIONS = """You are an educational clinical-report explainer for a prototype healthcare website.
 This is not a diagnostic service and you are not a substitute for a licensed clinician.
 - Start with a plain-language summary and identify report types reviewed.
@@ -465,7 +487,8 @@ def ai_analyze_reports():
                 parts.append(types.Part.from_text(text=f"File '{r['original_name']}' was not reviewed because its type is unsupported."))
         if included == 0:
             return error("No supported report files were available to analyze. Upload PDF, PNG, JPG, WEBP or TXT reports.")
-        response = client.models.generate_content(
+        response = generate_gemini_content(
+            client,
             model=AI_MODEL,
             contents=parts,
             config=types.GenerateContentConfig(system_instruction=AI_MEDICAL_INSTRUCTIONS, max_output_tokens=1800),
@@ -480,9 +503,11 @@ def ai_analyze_reports():
             )
         return jsonify(result=result_text, reportCount=included, model=AI_MODEL, createdAt=utc_now(),
                        notice="Reports were sent to Google Gemini for processing. This educational explanation is not a diagnosis.")
-    except Exception:
+    except Exception as exc:
         app.logger.exception("Gemini report analysis failed")
-        return error("AI report analysis failed. Check the server-side Gemini API key, free-tier quota, model availability, and uploaded file size.", 502)
+        if is_gemini_unavailable(exc):
+            return error("Gemini is temporarily experiencing high demand. Please wait a minute and try again.", 503)
+        return error("AI report analysis failed. Please try again later; check the server logs if the problem continues.", 502)
 
 @app.post("/api/ai/ask")
 @login_required
@@ -511,7 +536,8 @@ def ai_ask():
     )
     try:
         from google.genai import types
-        response = client.models.generate_content(
+        response = generate_gemini_content(
+            client,
             model=AI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(system_instruction=AI_MEDICAL_INSTRUCTIONS + "\nAnswer general educational questions without replacing a licensed clinician.", max_output_tokens=1000),
@@ -522,7 +548,9 @@ def ai_ask():
         return jsonify(answer=answer, model=AI_MODEL)
     except Exception as exc:
         app.logger.exception("Gemini assistant question failed")
-        return error(f"AI assistant failed: {type(exc).__name__}: {exc}", 502)
+        if is_gemini_unavailable(exc):
+            return error("Gemini is temporarily experiencing high demand. Please wait a minute and try again.", 503)
+        return error("AI assistant is temporarily unavailable. Please try again later.", 502)
 @app.errorhandler(413)
 def too_large(_):
     return jsonify(error="Upload too large. Maximum request size is 12 MB."), 413
