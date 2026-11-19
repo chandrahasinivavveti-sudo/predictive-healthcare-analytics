@@ -389,8 +389,9 @@ AI_FALLBACK_MODEL = os.environ.get(
 )
 
 
+
 def generate_gemini_content(client, **kwargs):
-    """Try the primary Gemini model, then a fallback on temporary 503 errors."""
+    """Retry temporary errors and switch models when quota is exhausted."""
 
     primary_model = kwargs.pop("model", AI_MODEL)
 
@@ -405,7 +406,7 @@ def generate_gemini_content(client, **kwargs):
         for attempt in range(2):
             try:
                 app.logger.info(
-                    "Sending Gemini request using model: %s",
+                    "Trying Gemini model: %s",
                     model_name
                 )
 
@@ -420,28 +421,43 @@ def generate_gemini_content(client, **kwargs):
                 last_error = exc
                 message = str(exc).upper()
 
-                is_temporary = (
+                quota_exhausted = (
+                    "429" in message or
+                    "RESOURCE_EXHAUSTED" in message
+                )
+
+                temporarily_unavailable = (
                     "503" in message or
                     "UNAVAILABLE" in message
                 )
 
-                if not is_temporary:
-                    raise
+                if quota_exhausted:
+                    app.logger.warning(
+                        "Quota exhausted for %s. "
+                        "Trying the next model.",
+                        model_name
+                    )
+                    break
 
-                if attempt == 0:
-                    app.logger.warning(
-                        "Gemini model %s returned 503. "
-                        "Retrying in 4 seconds.",
-                        model_name
-                    )
-                    time.sleep(4)
-                else:
-                    app.logger.warning(
-                        "Gemini model %s remains unavailable.",
-                        model_name
-                    )
+                if temporarily_unavailable:
+                    if attempt == 0:
+                        app.logger.warning(
+                            "%s unavailable. Retrying in 4 seconds.",
+                            model_name
+                        )
+                        time.sleep(4)
+                    else:
+                        app.logger.warning(
+                            "%s remains unavailable. "
+                            "Trying the next model.",
+                            model_name
+                        )
+                    continue
+
+                raise
 
     raise last_error
+
 
 AI_MEDICAL_INSTRUCTIONS = """You are an educational clinical-report explainer for a prototype healthcare website.
 This is not a diagnostic service and you are not a substitute for a licensed clinician.
