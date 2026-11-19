@@ -3,8 +3,8 @@ import re
 import json
 import sqlite3
 import secrets
-import base64
 import time
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 from functools import wraps
@@ -381,28 +381,67 @@ def get_ai_client():
     except ImportError:
         return None
 
+
 AI_MODEL = os.environ.get("PHA_AI_MODEL", "gemini-3.8-flash")
-
-
-def is_gemini_unavailable(exc):
-    """Return True when Gemini reports a temporary 503 outage."""
-    status_code = getattr(exc, "status_code", None)
-    message = str(exc)
-    return status_code == 503 or ("503" in message and "UNAVAILABLE" in message)
+AI_FALLBACK_MODEL = os.environ.get(
+    "PHA_AI_FALLBACK_MODEL",
+    "gemini-3.5-flash-lite"
+)
 
 
 def generate_gemini_content(client, **kwargs):
-    """Retry a Gemini 503 once; do not retry quota or other errors."""
-    for attempt in range(2):
-        try:
-            return client.models.generate_content(**kwargs)
-        except Exception as exc:
-            if not is_gemini_unavailable(exc) or attempt == 1:
-                raise
-            app.logger.warning(
-                "Gemini returned 503 UNAVAILABLE; retrying once after 2 seconds."
-            )
-            time.sleep(2)
+    """Try the primary Gemini model, then a fallback on temporary 503 errors."""
+
+    primary_model = kwargs.pop("model", AI_MODEL)
+
+    models_to_try = list(dict.fromkeys([
+        primary_model,
+        AI_FALLBACK_MODEL
+    ]))
+
+    last_error = None
+
+    for model_name in models_to_try:
+        for attempt in range(2):
+            try:
+                app.logger.info(
+                    "Sending Gemini request using model: %s",
+                    model_name
+                )
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    **kwargs
+                )
+
+                return response, model_name
+
+            except Exception as exc:
+                last_error = exc
+                message = str(exc).upper()
+
+                is_temporary = (
+                    "503" in message or
+                    "UNAVAILABLE" in message
+                )
+
+                if not is_temporary:
+                    raise
+
+                if attempt == 0:
+                    app.logger.warning(
+                        "Gemini model %s returned 503. "
+                        "Retrying in 4 seconds.",
+                        model_name
+                    )
+                    time.sleep(4)
+                else:
+                    app.logger.warning(
+                        "Gemini model %s remains unavailable.",
+                        model_name
+                    )
+
+    raise last_error
 
 AI_MEDICAL_INSTRUCTIONS = """You are an educational clinical-report explainer for a prototype healthcare website.
 This is not a diagnostic service and you are not a substitute for a licensed clinician.
@@ -487,7 +526,7 @@ def ai_analyze_reports():
                 parts.append(types.Part.from_text(text=f"File '{r['original_name']}' was not reviewed because its type is unsupported."))
         if included == 0:
             return error("No supported report files were available to analyze. Upload PDF, PNG, JPG, WEBP or TXT reports.")
-        response = generate_gemini_content(
+        response, used_model = generate_gemini_content(
             client,
             model=AI_MODEL,
             contents=parts,
@@ -499,15 +538,13 @@ def ai_analyze_reports():
         with connect_db() as db:
             db.execute(
                 "INSERT INTO ai_analyses(user_id,report_count,result_text,model_name,created_at) VALUES(?,?,?,?,?)",
-                (session["user_id"], included, result_text, AI_MODEL, utc_now())
+                (session["user_id"], included, result_text, used_model, utc_now())
             )
-        return jsonify(result=result_text, reportCount=included, model=AI_MODEL, createdAt=utc_now(),
+        return jsonify(result=result_text, reportCount=included, model=used_model, createdAt=utc_now(),
                        notice="Reports were sent to Google Gemini for processing. This educational explanation is not a diagnosis.")
-    except Exception as exc:
+    except Exception:
         app.logger.exception("Gemini report analysis failed")
-        if is_gemini_unavailable(exc):
-            return error("Gemini is temporarily experiencing high demand. Please wait a minute and try again.", 503)
-        return error("AI report analysis failed. Please try again later; check the server logs if the problem continues.", 502)
+        return error("AI report analysis failed. Check the server-side Gemini API key, free-tier quota, model availability, and uploaded file size.", 502)
 
 @app.post("/api/ai/ask")
 @login_required
@@ -536,7 +573,7 @@ def ai_ask():
     )
     try:
         from google.genai import types
-        response = generate_gemini_content(
+        response, used_model = generate_gemini_content(
             client,
             model=AI_MODEL,
             contents=prompt,
@@ -545,11 +582,9 @@ def ai_ask():
         answer = (getattr(response, "text", None) or "").strip()
         if not answer:
             return error("The AI provider returned an empty answer. Please try again.", 502)
-        return jsonify(answer=answer, model=AI_MODEL)
+        return jsonify(answer=answer, model=used_model)
     except Exception as exc:
         app.logger.exception("Gemini assistant question failed")
-        if is_gemini_unavailable(exc):
-            return error("Gemini is temporarily experiencing high demand. Please wait a minute and try again.", 503)
         return error("AI assistant is temporarily unavailable. Please try again later.", 502)
 @app.errorhandler(413)
 def too_large(_):
